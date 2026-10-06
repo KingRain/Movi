@@ -1,0 +1,2 @@
+# Optional — only needed for `python train_model.py` (KFGAN training)
+torch>=2.6.0
