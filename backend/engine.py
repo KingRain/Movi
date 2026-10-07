@@ -109,13 +109,62 @@ class Engine:
             start += args.batch_size
         return scores
 
-    def explain(self, user_id: int, movie_id: int) -> dict:
+    def explain(
+        self,
+        user_id: int,
+        movie_id: int,
+        *,
+        tmdb_id: int | None = None,
+        guest_token: str | None = None,
+    ) -> dict:
+        from kg.vocab import enrich_kfgan_edges
+        from kg_builder import relation_label, triples_for_movie
+        from metadata import movie_for_item, tmdb_movie_detail
+        from telemetry import aggregate_for_subject, behavior_triples_for_user
+
+        behavior_paths: list[str] = []
+        agg = aggregate_for_subject(user_id=user_id, guest_token=guest_token)
+        if tmdb_id:
+            for tid, data in agg.items():
+                rels = ", ".join(sorted(data["relations"])) or "implicit_interest"
+                behavior_paths.append(f"User -> [{rels}] -> TMDB:{tid}")
+
+        domain_edges: list[dict] = []
+        if tmdb_id:
+            detail = tmdb_movie_detail(tmdb_id)
+            if detail:
+                for person in detail.get("directors") or []:
+                    domain_edges.append(
+                        {
+                            "from_label": detail["title"],
+                            "rel_name": "directed_by",
+                            "to_label": person["name"],
+                            "path": f"{detail['title']} -> [directed_by] -> {person['name']}",
+                        }
+                    )
+                for person in detail.get("cast_top") or []:
+                    domain_edges.append(
+                        {
+                            "from_label": detail["title"],
+                            "rel_name": "starred_by",
+                            "to_label": person["name"],
+                            "path": f"{detail['title']} -> [starred_by] -> {person['name']}",
+                        }
+                    )
+
         if not self.ready:
             return {
                 "user_id": user_id,
                 "movie_id": movie_id,
-                "edges": [{"from": user_id, "to": movie_id, "rel": "stub"}],
+                "tmdb_id": tmdb_id,
+                "edges": domain_edges or [{"from": user_id, "to": movie_id, "rel": "stub"}],
+                "behavior_paths": behavior_paths,
+                "behavior_triples": behavior_triples_for_user(
+                    user_id=user_id,
+                    guest_token=guest_token,
+                ),
             }
+
         self._load()
         user_triples = self._data_info[5].get(user_id, [])
         item_triples = self._data_info[6].get(movie_id, [])
@@ -126,7 +175,35 @@ class Engine:
         for layer in range(len(item_triples)):
             h, r, t = item_triples[layer]
             edges.append({"from": int(h[0]), "rel": int(r[0]), "to": int(t[0]), "side": "item"})
-        return {"user_id": user_id, "movie_id": movie_id, "edges": edges}
+
+        enriched, nodes = enrich_kfgan_edges(
+            edges,
+            lambda item_idx: movie_for_item(item_idx),
+        )
+        for edge in enriched:
+            edge["rel_name"] = relation_label(int(edge["rel"]))
+            edge["path"] = (
+                f"{edge.get('from_label', edge['from'])} -> "
+                f"[{edge['rel_name']}] -> "
+                f"{edge.get('to_label', edge['to'])}"
+            )
+
+        if tmdb_id:
+            _ = triples_for_movie(tmdb_id)
+
+        return {
+            "user_id": user_id,
+            "movie_id": movie_id,
+            "tmdb_id": tmdb_id,
+            "edges": enriched,
+            "nodes": nodes,
+            "domain_edges": domain_edges,
+            "behavior_paths": behavior_paths,
+            "behavior_triples": behavior_triples_for_user(
+                user_id=user_id,
+                guest_token=guest_token,
+            ),
+        }
 
 
 engine = Engine()

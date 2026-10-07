@@ -180,4 +180,20 @@ def kg_propagation(args, kg, init_entity_set, set_size,is_user):
     return triple_sets
 
 
+def merge_behavior_items(
+    user_init_entity_set: dict,
+    user_id: int,
+    extra_item_ids: list[int],
+) -> dict:
+    """Add high-intent implicit items to a user's initial KG seed set."""
+    merged = dict(user_init_entity_set)
+    seeds = list(merged.get(user_id, []))
+    for item_id in extra_item_ids:
+        if item_id not in seeds:
+            seeds.append(item_id)
+    if seeds:
+        merged[user_id] = seeds
+    return merged
+
+
     

@@ -1,20 +1,26 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { AuthPanel } from "@/components/auth-panel";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CinemaHeader } from "@/components/cinema-header";
+import { MoviePosterCard } from "@/components/movie-poster-card";
+import { useMoviUser } from "@/components/movi-user-provider";
+import { MovieRow } from "@/components/movie-row";
+import { TrailerModal, type TrailerModalState } from "@/components/trailer-modal";
+import { buildCatalogRows } from "@/lib/row-catalog";
 import {
-  clearAccountTaste,
   fetchAccountTaste,
   fetchGenres,
-  getStoredUser,
+  getGuestToken,
+  getToken,
+  installTelemetryBeacon,
+  MOVIE_CACHE_STORAGE_KEY,
+  onTelemetryFlushed,
   syncMovieToAccount,
-  type AuthUser,
+  TASTE_STORAGE_KEY,
 } from "@/lib/auth";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-const TASTE_KEY = "movi-taste";
-const MOVIE_CACHE_KEY = "movi-movie-cache";
 
 type Movie = {
   id: number;
@@ -27,13 +33,17 @@ type Movie = {
   score?: number | null;
 };
 
-type TasteProfile = {
-  watched: number[];
-};
+type TasteProfile = { watched: number[] };
 
 type RecFilters = {
   era: "all" | "new" | "classic";
   genreId: number | null;
+};
+
+type GenreSection = {
+  genre_id: number;
+  name: string;
+  movies: Movie[];
 };
 
 const DEFAULT_FILTERS: RecFilters = { era: "all", genreId: null };
@@ -50,32 +60,31 @@ function dedupeMovies(list: Movie[]): Movie[] {
 function loadGuestTaste(): TasteProfile {
   if (typeof window === "undefined") return { watched: [] };
   try {
-    const raw = localStorage.getItem(TASTE_KEY);
+    const raw = localStorage.getItem(TASTE_STORAGE_KEY);
     if (!raw) return { watched: [] };
     const parsed = JSON.parse(raw) as { watched?: number[]; liked?: number[] };
     if (Array.isArray(parsed.watched)) return { watched: parsed.watched };
-    const merged = [...(parsed.liked ?? []), ...(parsed.watched ?? [])];
-    return { watched: [...new Set(merged)] };
+    return { watched: [...new Set([...(parsed.liked ?? []), ...(parsed.watched ?? [])])] };
   } catch {
     return { watched: [] };
   }
 }
 
 function saveGuestTaste(profile: TasteProfile) {
-  localStorage.setItem(TASTE_KEY, JSON.stringify(profile));
+  localStorage.setItem(TASTE_STORAGE_KEY, JSON.stringify(profile));
 }
 
 function loadMovieCache(): Record<number, Movie> {
   if (typeof window === "undefined") return {};
   try {
-    return JSON.parse(localStorage.getItem(MOVIE_CACHE_KEY) ?? "{}") as Record<number, Movie>;
+    return JSON.parse(localStorage.getItem(MOVIE_CACHE_STORAGE_KEY) ?? "{}") as Record<number, Movie>;
   } catch {
     return {};
   }
 }
 
 function saveMovieCache(cache: Record<number, Movie>) {
-  localStorage.setItem(MOVIE_CACHE_KEY, JSON.stringify(cache));
+  localStorage.setItem(MOVIE_CACHE_STORAGE_KEY, JSON.stringify(cache));
 }
 
 function cacheMovies(cache: Record<number, Movie>, movies: Movie[]): Record<number, Movie> {
@@ -84,113 +93,94 @@ function cacheMovies(cache: Record<number, Movie>, movies: Movie[]): Record<numb
   return next;
 }
 
-function EyeIcon({ filled }: { filled?: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" className="taste-icon" aria-hidden>
-      <path
-        d="M12 5C7 5 2.73 8.11 1 12c1.73 3.89 6 7 11 7s9.27-3.11 11-7c-1.73-3.89-6-7-11-7Zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"
-        fill={filled ? "currentColor" : "none"}
-        stroke="currentColor"
-        strokeWidth="1.5"
-      />
-    </svg>
-  );
-}
-
-function MoviePosterCard({
-  movie,
-  watched,
-  onToggleWatched,
-  onSelect,
-  selected,
-}: {
-  movie: Movie;
-  watched: boolean;
-  onToggleWatched: () => void;
-  onSelect?: () => void;
-  selected?: boolean;
-}) {
-  const posterInner = (
-    <div className="poster-media">
-      {movie.poster_url ? (
-        <Image
-          src={movie.poster_url}
-          alt=""
-          fill
-          className="object-cover"
-          sizes="(max-width: 640px) 28vw, (max-width: 1024px) 20vw, 140px"
-        />
-      ) : (
-        <div className="flex h-full items-center justify-center text-xs text-ash">No image</div>
-      )}
-      <div className="poster-title">
-        <p>{movie.title}</p>
-        {movie.release_year ? <span className="poster-year">{movie.release_year}</span> : null}
-      </div>
-    </div>
-  );
-
-  return (
-    <div
-      className={`poster-card group ${watched ? "is-watched" : ""} ${selected ? "is-selected" : ""}`}
-    >
-      {onSelect ? (
-        <button
-          type="button"
-          onClick={onSelect}
-          aria-label={`View ${movie.title}`}
-          className="poster-btn poster-btn-plain"
-        >
-          {posterInner}
-        </button>
-      ) : (
-        <div className="poster-btn poster-btn-plain">{posterInner}</div>
-      )}
-
-      <button
-        type="button"
-        className={`poster-badge-checkbox ${watched ? "is-checked" : ""}`}
-        aria-label={watched ? `Unmark ${movie.title} as watched` : `Mark ${movie.title} as watched`}
-        aria-pressed={watched}
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggleWatched();
-        }}
-      >
-        <svg viewBox="0 0 20 20" className="checkbox-icon" aria-hidden="true">
-          {watched ? (
-            <path
-              d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-              fill="currentColor"
-            />
-          ) : (
-            <circle cx="10" cy="10" r="7" stroke="currentColor" strokeWidth="1.5" fill="none" />
-          )}
-        </svg>
-      </button>
-    </div>
-  );
+function matchLabel(score: number | null | undefined, rank: number): string | null {
+  if (score != null && score > 0) {
+    return `${Math.min(99, Math.round(score * 10 + 70))}% Match`;
+  }
+  if (rank === 0) return "Top Pick";
+  return null;
 }
 
 export function MoviHome() {
-  const [user, setUser] = useState<AuthUser | null>(null);
+  const { user, setUser } = useMoviUser();
   const [taste, setTaste] = useState<TasteProfile>({ watched: [] });
   const [movieCache, setMovieCache] = useState<Record<number, Movie>>({});
-  const [trending, setTrending] = useState<Movie[]>([]);
   const [genres, setGenres] = useState<{ id: number; name: string }[]>([]);
   const [draftFilters, setDraftFilters] = useState<RecFilters>(DEFAULT_FILTERS);
   const [appliedFilters, setAppliedFilters] = useState<RecFilters>(DEFAULT_FILTERS);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<Movie[]>([]);
-  const [searching, setSearching] = useState(false);
   const [movies, setMovies] = useState<Movie[]>([]);
-  const [selected, setSelected] = useState<Movie | null>(null);
+  const moviesRef = useRef<Movie[]>([]);
+  moviesRef.current = movies;
+  const [recent, setRecent] = useState<Movie[]>([]);
+  const [topRated, setTopRated] = useState<Movie[]>([]);
+  const [genreSections, setGenreSections] = useState<GenreSection[]>([]);
   const [reason, setReason] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const filtersDirty =
-    draftFilters.era !== appliedFilters.era || draftFilters.genreId !== appliedFilters.genreId;
+  const [focusedInstanceId, setFocusedInstanceId] = useState<string | null>(null);
+  const [playingInstanceId, setPlayingInstanceId] = useState<string | null>(null);
+  const [trailerKeys, setTrailerKeys] = useState<Record<number, string>>({});
+  const [trailerLoadingInstanceId, setTrailerLoadingInstanceId] = useState<string | null>(null);
+  const [trailerModal, setTrailerModal] = useState<TrailerModalState | null>(null);
+  const [trailerLoading, setTrailerLoading] = useState(false);
+  const playingInstanceRef = useRef<string | null>(null);
+  const trailerKeysRef = useRef(trailerKeys);
+  trailerKeysRef.current = trailerKeys;
+
+  const fetchTrailerKey = useCallback(async (tmdbId: number): Promise<string | null> => {
+    const cached = trailerKeysRef.current[tmdbId];
+    if (cached) return cached;
+    try {
+      const res = await fetch(`${API}/movies/${tmdbId}/videos`);
+      if (!res.ok) return null;
+      const data = (await res.json()) as { key?: string };
+      if (data.key) {
+        setTrailerKeys((prev) => ({ ...prev, [tmdbId]: data.key! }));
+        return data.key;
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }, []);
+
+  const openTrailerFor = useCallback(async (movie: Movie) => {
+    setTrailerLoading(true);
+    setTrailerModal({ tmdbId: movie.tmdb_id, title: movie.title, youtubeKey: "" });
+    const key = await fetchTrailerKey(movie.tmdb_id);
+    if (key) {
+      setTrailerModal({ tmdbId: movie.tmdb_id, title: movie.title, youtubeKey: key });
+    }
+    setTrailerLoading(false);
+  }, [fetchTrailerKey]);
+
+  const activateInlineTrailer = useCallback(
+    async (movie: Movie, instanceId: string) => {
+      playingInstanceRef.current = instanceId;
+      setPlayingInstanceId(instanceId);
+      setFocusedInstanceId(instanceId);
+      if (trailerKeys[movie.tmdb_id]) return;
+      setTrailerLoadingInstanceId(instanceId);
+      const key = await fetchTrailerKey(movie.tmdb_id);
+      setTrailerLoadingInstanceId(null);
+      if (playingInstanceRef.current !== instanceId) return;
+      if (!key) {
+        playingInstanceRef.current = null;
+        setPlayingInstanceId(null);
+        setFocusedInstanceId((id) => (id === instanceId ? null : id));
+      }
+    },
+    [fetchTrailerKey],
+  );
+
+  const deactivateInlineTrailer = useCallback((instanceId: string) => {
+    if (playingInstanceRef.current === instanceId) {
+      playingInstanceRef.current = null;
+      setPlayingInstanceId(null);
+    }
+    setFocusedInstanceId((id) => (id === instanceId ? null : id));
+  }, []);
 
   const applyTasteFromServer = useCallback((data: { watched: number[]; movies: Movie[] }) => {
     setTaste({ watched: data.watched });
@@ -201,25 +191,37 @@ export function MoviHome() {
     });
   }, []);
 
+  const cacheAll = useCallback((list: Movie[]) => {
+    setMovieCache((prev) => cacheMovies(prev, list));
+  }, []);
+
+  useEffect(() => installTelemetryBeacon(), []);
+
   useEffect(() => {
-    setUser(getStoredUser());
     setMovieCache(loadMovieCache());
 
-    fetch(`${API}/movies/trending?k=20`)
+    fetch(`${API}/movies/browse?k=22`)
       .then((r) => r.json())
-      .then((d: { movies: Movie[] }) => {
-        const list = dedupeMovies(d.movies);
-        setTrending(list);
-        setMovieCache((prev) => {
-          const next = cacheMovies(prev, list);
-          saveMovieCache(next);
-          return next;
-        });
-      })
-      .catch(() => setError("Could not load films. Start the backend on port 8000."));
+      .then(
+        (d: {
+          recent: Movie[];
+          top_rated: Movie[];
+          genres: GenreSection[];
+        }) => {
+          setRecent(dedupeMovies(d.recent ?? []));
+          setTopRated(dedupeMovies(d.top_rated ?? []));
+          setGenreSections(d.genres ?? []);
+          cacheAll([
+            ...(d.recent ?? []),
+            ...(d.top_rated ?? []),
+            ...(d.genres ?? []).flatMap((g) => g.movies),
+          ]);
+        },
+      )
+      .catch(() => setError("Could not load catalog. Start the backend on port 8000."));
 
     fetchGenres().then(setGenres);
-  }, []);
+  }, [cacheAll]);
 
   useEffect(() => {
     if (!user) {
@@ -231,330 +233,236 @@ export function MoviHome() {
     });
   }, [user, applyTasteFromServer]);
 
-  useEffect(() => {
-    const q = searchQuery.trim();
-    if (q.length < 2) {
-      setSearchResults([]);
-      setSearching(false);
-      return;
-    }
-    setSearching(true);
-    const timer = window.setTimeout(() => {
-      fetch(`${API}/movies/search?q=${encodeURIComponent(q)}&k=16`)
-        .then((r) => r.json())
-        .then((d: { movies: Movie[] }) => {
-          const list = dedupeMovies(d.movies);
-          setSearchResults(list);
-          setMovieCache((prev) => {
-            const next = cacheMovies(prev, list);
-            saveMovieCache(next);
-            return next;
-          });
-        })
-        .catch(() => setSearchResults([]))
-        .finally(() => setSearching(false));
-    }, 320);
-    return () => window.clearTimeout(timer);
-  }, [searchQuery]);
-
   const loadPicks = useCallback(async (watchedIds: number[], recFilters: RecFilters) => {
     setLoading(true);
     setError("");
     try {
-      const params = new URLSearchParams({ k: "8" });
+      const params = new URLSearchParams({ k: "18" });
       if (watchedIds.length) params.set("watched", watchedIds.join(","));
       if (recFilters.era !== "all") params.set("era", recFilters.era);
       if (recFilters.genreId) params.set("genre_id", String(recFilters.genreId));
-      const res = await fetch(`${API}/recommend/for-you?${params}`);
+      const headers: HeadersInit = {};
+      const token = getToken();
+      if (token) headers.Authorization = `Bearer ${token}`;
+      else headers["X-Guest-Token"] = getGuestToken();
+      const res = await fetch(`${API}/recommend/for-you?${params}`, { headers });
       if (!res.ok) throw new Error("failed");
       const data = (await res.json()) as { movies: Movie[]; reason?: string };
-      const unique = dedupeMovies(data.movies);
+      const unique = dedupeMovies(data.movies ?? []);
       setMovies(unique);
       setReason(data.reason ?? "");
-      setSelected((prev) => {
-        if (prev && unique.some((m) => m.tmdb_id === prev.tmdb_id)) return prev;
-        return unique[0] ?? null;
-      });
+      cacheAll(unique);
     } catch {
-      setError(`Backend unreachable at ${API}`);
-      setMovies([]);
-      setSelected(null);
+      if (moviesRef.current.length === 0) {
+        setError(`Backend unreachable at ${API}`);
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [cacheAll]);
 
   useEffect(() => {
     loadPicks(taste.watched, appliedFilters);
   }, [taste.watched, appliedFilters, loadPicks]);
 
-  const rememberMovie = (movie: Movie) => {
+  useEffect(() => {
+    let debounce: number | null = null;
+    const unsub = onTelemetryFlushed(() => {
+      if (debounce !== null) window.clearTimeout(debounce);
+      debounce = window.setTimeout(() => {
+        void loadPicks(taste.watched, appliedFilters);
+      }, 800);
+    });
+    return () => {
+      unsub();
+      if (debounce !== null) window.clearTimeout(debounce);
+    };
+  }, [loadPicks, taste.watched, appliedFilters]);
+
+  const toggleWatched = (movie: Movie) => {
     setMovieCache((prev) => {
       const next = cacheMovies(prev, [movie]);
       saveMovieCache(next);
       return next;
     });
-  };
-
-  const toggleWatched = (movie: Movie) => {
-    rememberMovie(movie);
     const nextWatched = taste.watched.includes(movie.tmdb_id)
       ? taste.watched.filter((x) => x !== movie.tmdb_id)
       : [...taste.watched, movie.tmdb_id];
-
     setTaste({ watched: nextWatched });
     if (!user) saveGuestTaste({ watched: nextWatched });
     else void syncMovieToAccount({ ...movie, watched: nextWatched.includes(movie.tmdb_id) });
   };
 
-  const clearTaste = async () => {
-    setTaste({ watched: [] });
-    if (user) await clearAccountTaste();
-    else saveGuestTaste({ watched: [] });
-  };
+  const catalogRows = useMemo(
+    () => buildCatalogRows(movies, recent, topRated, genreSections),
+    [movies, recent, topRated, genreSections],
+  );
 
-  const applyFilters = () => {
-    setAppliedFilters({ ...draftFilters });
-  };
+  const heroMovie = movies[0] ?? catalogRows.recentRow[0] ?? catalogRows.topRatedRow[0] ?? null;
 
-  const displayMovies = useMemo(() => {
-    const base = searchQuery.trim().length >= 2 ? searchResults : trending;
-    return dedupeMovies(base);
-  }, [searchQuery, searchResults, trending]);
-
-  const hasWatched = taste.watched.length > 0;
-
-  const handleAuthChange = async (nextUser: AuthUser | null) => {
-    setUser(nextUser);
-    if (nextUser) {
-      const data = await fetchAccountTaste();
-      if (data) applyTasteFromServer(data);
-    } else {
-      setTaste(loadGuestTaste());
-    }
+  const renderCard = (movie: Movie, rowId: string, rank = 0, showMatch = false) => {
+    const instanceId = `${rowId}-${movie.tmdb_id}`;
+    return (
+      <MoviePosterCard
+        key={instanceId}
+        movie={movie}
+        watched={taste.watched.includes(movie.tmdb_id)}
+        focused={focusedInstanceId === instanceId}
+        matchBadge={showMatch ? matchLabel(movie.score, rank) : null}
+        youtubeKey={trailerKeys[movie.tmdb_id] ?? null}
+        trailerLoading={trailerLoadingInstanceId === instanceId}
+        isInlinePlaying={playingInstanceId === instanceId}
+        onToggleWatched={() => toggleWatched(movie)}
+        onHoverFocus={(active) => {
+          if (active) setFocusedInstanceId(instanceId);
+          else setFocusedInstanceId((id) => (id === instanceId ? null : id));
+        }}
+        onTrailerActivate={() => void activateInlineTrailer(movie, instanceId)}
+        onTrailerDeactivate={() => deactivateInlineTrailer(instanceId)}
+        onPrefetchTrailer={() => void fetchTrailerKey(movie.tmdb_id)}
+      />
+    );
   };
 
   return (
-    <div className="cosmic-bg min-h-screen">
-      <header className="sticky top-0 z-20 border-b border-charcoal/50 bg-void/95 backdrop-blur-md">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
-          <div className="min-w-0">
-            <span className="text-lg font-medium text-carbon-vellum">Movi</span>
-            <span className="ml-2 hidden text-xs text-ash sm:inline">Search · mark watched · get picks</span>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <AuthPanel user={user} onAuthChange={handleAuthChange} />
-            {hasWatched && (
-              <button type="button" className="pill-ghost-sm" onClick={() => void clearTaste()}>
-                Clear
+    <div className="cinema-shell">
+      <section className="cinema-hero">
+        {heroMovie?.poster_url ? (
+          <Image
+            src={heroMovie.poster_url}
+            alt=""
+            fill
+            priority
+            className="cinema-hero-bg object-cover"
+            sizes="100vw"
+          />
+        ) : null}
+        <div className="cinema-hero-scrim" aria-hidden />
+
+        <CinemaHeader variant="overlay" />
+
+        {heroMovie ? (
+          <div className="cinema-hero-copy">
+            <p className="cinema-hero-kicker">
+              Knowledge-graph recommendations · hover &amp; trailer signals shape your first row
+            </p>
+            <h1 className="cinema-hero-title">{heroMovie.title.toUpperCase()}</h1>
+            <p className="cinema-hero-desc">
+              {heroMovie.overview ||
+                "Mark what you've watched, preview trailers, and Movi ranks films in Recommended for You below."}
+            </p>
+            <div className="cinema-hero-actions">
+              <button
+                type="button"
+                className="cinema-btn-watch"
+                onClick={() => void openTrailerFor(heroMovie)}
+              >
+                <span aria-hidden>▶</span> Watch trailer
               </button>
-            )}
-            <button
-              type="button"
-              className="pill-primary px-4 py-2 text-sm"
-              onClick={() => loadPicks(taste.watched, appliedFilters)}
-              disabled={loading}
-            >
-              {loading ? "…" : "Refresh"}
-            </button>
+              <button
+                type="button"
+                className="cinema-btn-info"
+                onClick={() => toggleWatched(heroMovie)}
+              >
+                {taste.watched.includes(heroMovie.tmdb_id) ? "In My List" : "＋ My List"}
+              </button>
+            </div>
           </div>
+        ) : null}
+      </section>
+
+      <main className="cinema-rows">
+        <div className="hub-filters cinema-filters">
+          <select
+            value={draftFilters.era}
+            onChange={(e) => setDraftFilters((f) => ({ ...f, era: e.target.value as RecFilters["era"] }))}
+            className="hub-filter-select"
+          >
+            <option value="all">All years</option>
+            <option value="new">New releases</option>
+            <option value="classic">Classics</option>
+          </select>
+          <select
+            value={draftFilters.genreId ?? ""}
+            onChange={(e) =>
+              setDraftFilters((f) => ({
+                ...f,
+                genreId: e.target.value ? Number(e.target.value) : null,
+              }))
+            }
+            className="hub-filter-select"
+          >
+            <option value="">All genres</option>
+            {genres.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="hub-filter-apply"
+            onClick={() => setAppliedFilters({ ...draftFilters })}
+            disabled={loading}
+          >
+            Apply to recommendations
+          </button>
+          <button type="button" className="hub-filter-ghost" onClick={() => loadPicks(taste.watched, appliedFilters)}>
+            Refresh picks
+          </button>
         </div>
-      </header>
 
-      <main className="mx-auto max-w-6xl px-4 pb-16 pt-6 sm:px-6 sm:pt-8 lg:pt-10">
-        <div className="mb-6 max-w-2xl sm:mb-8">
-          <p className="eyebrow mb-2 sm:mb-3">WELCOME</p>
-          <h1 className="text-2xl font-normal leading-tight tracking-tight text-carbon-vellum sm:text-3xl lg:text-4xl">
-            What have you watched lately?
-          </h1>
-          <p className="mt-2 text-sm text-smoke sm:mt-3 sm:text-base">
-            Search films and mark them watched using the circle checkbox on top right
-            {user ? ` — synced to ${user.username}` : " — sign in to save across sessions"}.
-          </p>
-        </div>
+        {error ? <p className="hub-error">{error}</p> : null}
 
-        <div className="flex flex-col gap-6 lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] lg:items-start lg:gap-8">
-          <section className="product-frame p-4 sm:p-5">
-            <div className="mb-4 flex items-start gap-3">
-              <span className="step-badge mt-0.5 shrink-0">1</span>
-              <div className="min-w-0 flex-1">
-                <h2 className="text-base font-medium text-carbon-vellum sm:text-lg">Your watch history</h2>
-                <p className="mt-1 text-xs text-ash sm:text-sm">Tap the circular check mark on any card to mark as watched</p>
-              </div>
+        <MovieRow
+          eyebrow="FOR YOU"
+          title="Recommendations"
+          subtitle={
+            loading
+              ? "Updating from watches, hovers, and trailers…"
+              : reason || "Your personalized row — everything else is browse catalog below"
+          }
+        >
+          {loading && movies.length === 0 ? (
+            <div className="swimlane-skeleton" aria-busy="true">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div key={i} className="hub-card-skeleton" />
+              ))}
             </div>
+          ) : movies.length === 0 ? (
+            <p className="swimlane-empty">Mark films or preview trailers to personalize this row.</p>
+          ) : (
+            movies.map((m, i) => renderCard(m, "recs", i, true))
+          )}
+        </MovieRow>
 
-            <div className="mb-4">
-              <label htmlFor="film-search" className="sr-only">
-                Search films
-              </label>
-              <div className="search-field">
-                <svg className="search-icon" viewBox="0 0 20 20" fill="none" aria-hidden>
-                  <path
-                    d="M9 3.5a5.5 5.5 0 1 0 3.47 9.79l3.2 3.2a.75.75 0 1 0 1.06-1.06l-3.2-3.2A5.5 5.5 0 0 0 9 3.5Z"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                  />
-                </svg>
-                <input
-                  id="film-search"
-                  type="search"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search any film…"
-                  className="search-input"
-                  autoComplete="off"
-                />
-                {searchQuery && (
-                  <button
-                    type="button"
-                    className="search-clear"
-                    aria-label="Clear search"
-                    onClick={() => setSearchQuery("")}
-                  >
-                    ×
-                  </button>
-                )}
-              </div>
-              {searchQuery.trim().length >= 2 && (
-                <p className="mt-2 text-xs text-ash">
-                  {searching ? "Searching…" : `${displayMovies.length} result(s)`}
-                </p>
-              )}
-            </div>
+        <div id="catalog">
+          <MovieRow eyebrow="NOW PLAYING" title="In Theaters Now">
+            {catalogRows.recentRow.map((m) => renderCard(m, "recent"))}
+          </MovieRow>
 
-            {displayMovies.length === 0 && searchQuery.trim().length >= 2 && !searching ? (
-              <p className="rounded-lg border border-dashed border-twilight/50 px-3 py-4 text-center text-sm text-ash">
-                No films found for &ldquo;{searchQuery.trim()}&rdquo;
-              </p>
-            ) : (
-              <ul className="grid grid-cols-3 gap-2 sm:grid-cols-4 sm:gap-3 md:grid-cols-4 lg:grid-cols-3 xl:grid-cols-4">
-                {displayMovies.map((movie) => (
-                  <li key={movie.tmdb_id}>
-                    <MoviePosterCard
-                      movie={movie}
-                      watched={taste.watched.includes(movie.tmdb_id)}
-                      onToggleWatched={() => toggleWatched(movie)}
-                    />
-                  </li>
-                ))}
-              </ul>
-            )}
+          <MovieRow eyebrow="TOP CHARTS" title="Top Rated">
+            {catalogRows.topRatedRow.map((m) => renderCard(m, "top"))}
+          </MovieRow>
 
-            {!hasWatched && searchQuery.trim().length < 2 && (
-              <p className="mt-4 rounded-lg border border-dashed border-twilight/50 px-3 py-2 text-xs text-ash sm:text-sm">
-                Mark films with the eye icon — trending picks show on the right until you do.
-              </p>
-            )}
-          </section>
-
-          <section className="lg:sticky lg:top-[4.25rem]">
-            <div className="product-frame p-4 sm:p-5">
-              <div className="mb-4 flex items-start gap-3">
-                <span className="step-badge mt-0.5 shrink-0">2</span>
-                <div className="min-w-0 flex-1">
-                  <h2 className="text-base font-medium text-carbon-vellum sm:text-lg">Recommended for you</h2>
-                  {reason && <p className="mt-1 text-xs text-smoke sm:text-sm">{reason}</p>}
-                  {error && <p className="mt-1 text-xs text-iris-glow sm:text-sm">{error}</p>}
-                  {loading && <p className="mt-1 text-xs text-ash sm:text-sm">Finding films…</p>}
-                </div>
-              </div>
-
-              <div className="filter-bar mb-4">
-                <label className="filter-field">
-                  <span className="filter-label">When</span>
-                  <select
-                    value={draftFilters.era}
-                    onChange={(e) =>
-                      setDraftFilters((f) => ({ ...f, era: e.target.value as RecFilters["era"] }))
-                    }
-                    className="filter-select"
-                  >
-                    <option value="all">All years</option>
-                    <option value="new">New releases</option>
-                    <option value="classic">Classics</option>
-                  </select>
-                </label>
-                <label className="filter-field filter-field-grow">
-                  <span className="filter-label">Genre</span>
-                  <select
-                    value={draftFilters.genreId ?? ""}
-                    onChange={(e) =>
-                      setDraftFilters((f) => ({
-                        ...f,
-                        genreId: e.target.value ? Number(e.target.value) : null,
-                      }))
-                    }
-                    className="filter-select"
-                  >
-                    <option value="">All genres</option>
-                    {genres.map((g) => (
-                      <option key={g.id} value={g.id}>
-                        {g.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  type="button"
-                  className="filter-apply"
-                  onClick={applyFilters}
-                  disabled={loading || !filtersDirty}
-                >
-                  Apply
-                </button>
-              </div>
-
-              {!loading && movies.length === 0 && !error && (
-                <p className="text-sm text-ash">No matches for these filters — try broadening them.</p>
-              )}
-
-              <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3 lg:grid-cols-2 xl:grid-cols-4">
-                {movies.map((movie) => (
-                  <li key={movie.tmdb_id}>
-                    <MoviePosterCard
-                      movie={movie}
-                      watched={taste.watched.includes(movie.tmdb_id)}
-                      onToggleWatched={() => toggleWatched(movie)}
-                      onSelect={() => setSelected(movie)}
-                      selected={selected?.tmdb_id === movie.tmdb_id}
-                    />
-                  </li>
-                ))}
-              </ul>
-            </div>
-
-            {selected && (
-              <div className="mt-4 product-frame p-4 sm:p-5">
-                <p className="eyebrow mb-2 !text-specter-lilac">NOW VIEWING</p>
-                <div className="flex flex-col gap-3 sm:flex-row sm:gap-4">
-                  {selected.poster_url && (
-                    <div className="relative mx-auto h-40 w-28 shrink-0 overflow-hidden rounded-[10px] border border-twilight sm:mx-0">
-                      <Image src={selected.poster_url} alt="" fill className="object-cover" sizes="112px" />
-                    </div>
-                  )}
-                  <div className="min-w-0 text-center sm:text-left">
-                    <h3 className="text-lg font-medium text-carbon-vellum sm:text-xl">
-                      {selected.title}
-                      {selected.release_year ? (
-                        <span className="ml-2 text-sm font-normal text-ash">({selected.release_year})</span>
-                      ) : null}
-                    </h3>
-                    <p className="mt-2 text-sm leading-relaxed text-ash">{selected.overview}</p>
-                    <button
-                      type="button"
-                      className={`detail-watched-btn mt-4 ${taste.watched.includes(selected.tmdb_id) ? "is-on" : ""}`}
-                      onClick={() => toggleWatched(selected)}
-                    >
-                      <EyeIcon filled={taste.watched.includes(selected.tmdb_id)} />
-                      {taste.watched.includes(selected.tmdb_id) ? "Marked as watched" : "Mark as watched"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </section>
+          {catalogRows.genreRows.map((section) =>
+            section.movies.length > 0 ? (
+              <MovieRow key={section.genre_id} title={section.name}>
+                {section.movies.map((m) => renderCard(m, `genre-${section.genre_id}`))}
+              </MovieRow>
+            ) : null,
+          )}
         </div>
       </main>
+
+      <TrailerModal
+        state={trailerModal}
+        loading={trailerLoading}
+        onClose={() => {
+          setTrailerModal(null);
+          setTrailerLoading(false);
+        }}
+      />
     </div>
   );
 }

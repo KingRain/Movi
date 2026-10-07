@@ -9,9 +9,25 @@ from pydantic import BaseModel, Field
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from engine import engine
-from guest import movie_genres, recommend_for_watched, search_movies, trending
+from guest import (
+    browse_catalog,
+    movie_genres,
+    movie_videos,
+    now_playing,
+    recommend_for_watched,
+    search_movies,
+    top_rated,
+    trending,
+)
 from metadata import movie_for_item
 from recommend import recommend as cf_recommend
+from telemetry import (
+    clear_interactions,
+    ensure_guest_token,
+    insert_interactions,
+    intent_seed_tmdb_ids,
+    register_guest_token,
+)
 from users import (
     clear_taste,
     get_taste,
@@ -70,6 +86,19 @@ class MovieTasteBody(BaseModel):
     genre_ids: list[int] = Field(default_factory=list)
 
 
+class InteractionEvent(BaseModel):
+    tmdb_id: int
+    event_type: str = Field(description="hover | trailer_progress | trailer_complete")
+    duration_ms: int = 0
+    completion_ratio: float | None = None
+    timestamp: int | None = None
+
+
+class InteractionBatchBody(BaseModel):
+    events: list[InteractionEvent] = Field(default_factory=list)
+    guest_token: str | None = None
+
+
 @app.get("/health")
 def health():
     import os
@@ -88,6 +117,21 @@ def movies_trending(k: int = 20):
     return {"movies": trending(k)}
 
 
+@app.get("/movies/now-playing")
+def movies_now_playing(k: int = 16):
+    return {"movies": now_playing(k)}
+
+
+@app.get("/movies/top-rated")
+def movies_top_rated(k: int = 16):
+    return {"movies": top_rated(k)}
+
+
+@app.get("/movies/browse")
+def movies_browse(k: int = 14):
+    return browse_catalog(k)
+
+
 @app.get("/movies/search")
 def movies_search(q: str = Query("", min_length=0), k: int = 12):
     return {"movies": search_movies(q, k=k)}
@@ -98,16 +142,63 @@ def movies_genres():
     return {"genres": movie_genres()}
 
 
+@app.get("/movies/{tmdb_id}/videos")
+def movies_videos(tmdb_id: int):
+    video = movie_videos(tmdb_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="No trailer available")
+    return video
+
+
+@app.post("/telemetry/interactions")
+def telemetry_interactions(
+    body: InteractionBatchBody,
+    user: Annotated[dict[str, Any] | None, Depends(optional_user)] = None,
+    x_guest_token: Annotated[str | None, Header()] = None,
+):
+    guest = ensure_guest_token(body.guest_token or x_guest_token)
+    register_guest_token(guest)
+    user_id = int(user["id"]) if user else None
+    payload = [e.model_dump() for e in body.events]
+    count = insert_interactions(payload, user_id=user_id, guest_token=None if user_id else guest)
+    return {"ok": True, "inserted": count, "guest_token": guest if not user_id else None}
+
+
+@app.delete("/telemetry/interactions")
+def telemetry_clear(
+    user: Annotated[dict[str, Any] | None, Depends(optional_user)] = None,
+    x_guest_token: Annotated[str | None, Header()] = None,
+):
+    user_id = int(user["id"]) if user else None
+    guest = None if user_id else ensure_guest_token(x_guest_token)
+    if user_id is None and not guest:
+        raise HTTPException(status_code=400, detail="guest token required")
+    deleted = clear_interactions(user_id=user_id, guest_token=None if user_id else guest)
+    return {"ok": True, "deleted": deleted}
+
+
 @app.get("/recommend/for-you")
 def recommend_for_you(
     watched: str = Query("", description="Comma-separated TMDB movie IDs you've watched"),
     era: str = Query("all", description="all | new | classic"),
     genre_id: int | None = Query(None),
     k: int = 8,
+    user: Annotated[dict[str, Any] | None, Depends(optional_user)] = None,
+    x_guest_token: Annotated[str | None, Header()] = None,
 ):
     watched_ids = [int(x) for x in watched.split(",") if x.strip().isdigit()]
     era_norm = era if era in {"all", "new", "classic"} else "all"
-    return recommend_for_watched(watched_ids, k=k, era=era_norm, genre_id=genre_id)
+    implicit = intent_seed_tmdb_ids(
+        user_id=int(user["id"]) if user else None,
+        guest_token=None if user else ensure_guest_token(x_guest_token),
+    )
+    return recommend_for_watched(
+        watched_ids,
+        k=k,
+        era=era_norm,
+        genre_id=genre_id,
+        implicit_seeds=implicit,
+    )
 
 
 @app.post("/auth/register")
@@ -178,13 +269,23 @@ def recommend(user_id: int, k: int = 10):
 
 
 @app.get("/explain/{user_id}/{movie_id}")
-def explain(user_id: int, movie_id: int):
-    data = engine.explain(user_id, movie_id)
+def explain(
+    user_id: int,
+    movie_id: int,
+    tmdb_id: int | None = Query(None),
+    x_guest_token: Annotated[str | None, Header()] = None,
+):
+    data = engine.explain(
+        user_id,
+        movie_id,
+        tmdb_id=tmdb_id,
+        guest_token=x_guest_token,
+    )
     data["movie"] = movie_for_item(movie_id)
     return data
 
 
 if __name__ == "__main__":
-    r = recommend_for_you(likes="550,155", k=3)
+    r = recommend_for_you(watched="550,155", k=3)
     assert len(r["movies"]) >= 1
     print("ok", r["movies"][0]["title"])

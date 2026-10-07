@@ -107,6 +107,61 @@ def movie_genres() -> list[dict]:
     return sorted(data.get("genres", []), key=lambda g: g.get("name", ""))
 
 
+def _movies_from_results(data: dict | None, k: int) -> list[dict]:
+    if not data:
+        return []
+    rows = _dedupe_rows(data.get("results", []))
+    return [_as_movie(m) for m in rows if m.get("poster_path")][:k]
+
+
+@lru_cache(maxsize=8)
+def now_playing(k: int = 16) -> list[dict]:
+    return _movies_from_results(_api("/movie/now_playing"), k)
+
+
+@lru_cache(maxsize=8)
+def top_rated(k: int = 16) -> list[dict]:
+    """TMDB top-rated list (common stand-in for curated “best of” rows)."""
+    return _movies_from_results(_api("/movie/top_rated"), k)
+
+
+@lru_cache(maxsize=32)
+def movies_by_genre(genre_id: int, k: int = 14) -> list[dict]:
+    sort_options = ("popularity.desc", "vote_average.desc", "release_date.desc", "revenue.desc")
+    sort_by = sort_options[genre_id % len(sort_options)]
+    page = (genre_id % 5) + 1
+    data = _api(
+        "/discover/movie",
+        {
+            "with_genres": str(genre_id),
+            "sort_by": sort_by,
+            "include_adult": "false",
+            "page": str(page),
+        },
+    )
+    return _movies_from_results(data, k)
+
+
+@lru_cache(maxsize=2)
+def browse_catalog(k_per_genre: int = 14) -> dict:
+    genre_rows: list[dict] = []
+    for genre in movie_genres():
+        movies = movies_by_genre(int(genre["id"]), k_per_genre)
+        if movies:
+            genre_rows.append(
+                {
+                    "genre_id": genre["id"],
+                    "name": genre["name"],
+                    "movies": movies,
+                }
+            )
+    return {
+        "recent": now_playing(k_per_genre),
+        "top_rated": top_rated(k_per_genre),
+        "genres": genre_rows,
+    }
+
+
 @lru_cache(maxsize=1)
 def trending(k: int = 20) -> list[dict]:
     data = _api("/trending/movie/week")
@@ -173,18 +228,41 @@ def _reason_text(
     return base
 
 
+def movie_videos(tmdb_id: int) -> dict | None:
+    data = _api(f"/movie/{tmdb_id}/videos")
+    if not data:
+        return None
+    results = data.get("results") or []
+    for clip in results:
+        if clip.get("site") == "YouTube" and clip.get("type") in {"Trailer", "Teaser"}:
+            return {
+                "tmdb_id": tmdb_id,
+                "key": clip.get("key"),
+                "name": clip.get("name", "Trailer"),
+                "type": clip.get("type"),
+                "youtube_url": f"https://www.youtube.com/watch?v={clip['key']}" if clip.get("key") else None,
+            }
+    return None
+
+
 def recommend_for_watched(
     watched_tmdb_ids: list[int],
     k: int = 8,
     era: str = "all",
     genre_id: int | None = None,
+    implicit_seeds: list[tuple[int, float]] | None = None,
 ) -> dict:
     """Because you watched X → TMDB similar movies, ranked by vote_average."""
     watched = {int(i) for i in watched_tmdb_ids if i > 0}
+    implicit = implicit_seeds or []
+    seed_ids = set(watched)
+    for tid, weight in implicit:
+        if weight >= 0.35:
+            seed_ids.add(int(tid))
     has_filters = era != "all" or genre_id is not None
     pool_size = max(k * 8, 48) if has_filters else max(k * 5, 32)
 
-    if not watched:
+    if not seed_ids:
         movies = _apply_filters(trending(pool_size), era, genre_id)[:k]
         return {
             "movies": movies,
@@ -195,7 +273,11 @@ def recommend_for_watched(
     scores: dict[int, float] = defaultdict(float)
     details: dict[int, dict] = {}
 
-    for mid in watched:
+    for mid in seed_ids:
+        boost = 1.0
+        for tid, w in implicit:
+            if int(tid) == int(mid):
+                boost = max(boost, w)
         data = _api(f"/movie/{mid}/recommendations")
         if not data:
             continue
@@ -203,7 +285,7 @@ def recommend_for_watched(
             tid = int(row["id"])
             if tid in watched:
                 continue
-            scores[tid] += (25 - rank) * float(row.get("vote_average") or 0)
+            scores[tid] += boost * (25 - rank) * float(row.get("vote_average") or 0)
             details.setdefault(tid, row)
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -231,6 +313,7 @@ def recommend_for_watched(
         "mode": "taste",
         "reason": _reason_text(len(watched), era, genre_id, trending=False),
         "watched": list(watched),
+        "implicit_seeds": [tid for tid, _ in implicit[:8]],
     }
 
 

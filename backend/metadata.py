@@ -30,6 +30,55 @@ def _tmdb_headers() -> dict[str, str]:
     return headers
 
 
+@lru_cache(maxsize=256)
+def tmdb_movie_detail(tmdb_id: int) -> dict | None:
+    """Credits, keywords, and collection for KG expansion."""
+    key = os.environ.get("TMDB_API_KEY", "").strip()
+    token = os.environ.get("TMDB_READ_TOKEN", "").strip()
+    if not key and not token:
+        return None
+
+    params: dict[str, str] = {"append_to_response": "credits,keywords"}
+    if key:
+        params["api_key"] = key
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?{urlencode(params)}"
+
+    try:
+        with urlopen(Request(url, headers=_tmdb_headers()), timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+    except (HTTPError, URLError, TimeoutError, KeyError, json.JSONDecodeError):
+        return None
+
+    credits = data.get("credits") or {}
+    directors = [
+        {"id": p["id"], "name": p.get("name", "Director")}
+        for p in credits.get("crew") or []
+        if p.get("job") == "Director"
+    ]
+    cast_top = [
+        {"id": p["id"], "name": p.get("name", "Actor")}
+        for p in (credits.get("cast") or [])[:3]
+    ]
+    keywords = [k.get("name") for k in (data.get("keywords") or {}).get("keywords", []) if k.get("name")]
+    belongs = data.get("belongs_to_collection")
+    collection = (
+        {"id": belongs["id"], "name": belongs.get("name", "Collection")}
+        if belongs
+        else None
+    )
+
+    return {
+        "tmdb_id": data.get("id", tmdb_id),
+        "title": data.get("title", "Unknown"),
+        "overview": data.get("overview", ""),
+        "genre_ids": [int(g["id"]) for g in (data.get("genres") or []) if "id" in g],
+        "keywords": keywords[:12],
+        "directors": directors,
+        "cast_top": cast_top,
+        "collection": collection,
+    }
+
+
 @lru_cache(maxsize=512)
 def tmdb_by_id(tmdb_id: int) -> dict | None:
     key = os.environ.get("TMDB_API_KEY", "").strip()
@@ -47,11 +96,13 @@ def tmdb_by_id(tmdb_id: int) -> dict | None:
     try:
         with urlopen(Request(url, headers=_tmdb_headers()), timeout=10) as resp:
             data = json.loads(resp.read().decode())
+        genres = data.get("genres") or []
         return {
             "tmdb_id": data.get("id", tmdb_id),
             "title": data.get("title", "Unknown"),
             "overview": data.get("overview", ""),
             "poster_url": f"{TMDB_IMG}{data['poster_path']}" if data.get("poster_path") else None,
+            "genre_ids": [g["id"] for g in genres if "id" in g],
         }
     except (HTTPError, URLError, TimeoutError, KeyError, json.JSONDecodeError):
         return None
