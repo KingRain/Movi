@@ -38,7 +38,7 @@ def _api(path: str, params: dict | None = None) -> dict | None:
         q["api_key"] = key
     url = f"https://api.themoviedb.org/3{path}?{urlencode(q)}"
     try:
-        with urlopen(Request(url, headers=_headers()), timeout=12) as resp:
+        with urlopen(Request(url, headers=_headers()), timeout=4) as resp:
             return json.loads(resp.read().decode())
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
         return None
@@ -51,17 +51,23 @@ def _release_year(row: dict) -> int | None:
     return None
 
 
+from metadata import tmdb_trailer_key
+
+
 def _as_movie(row: dict, score: float | None = None) -> dict:
+    mid = int(row["id"])
     return {
-        "id": row["id"],
-        "tmdb_id": row["id"],
+        "id": mid,
+        "tmdb_id": mid,
         "title": row.get("title", "Unknown"),
         "overview": row.get("overview", ""),
         "poster_url": f"{TMDB_IMG}{row['poster_path']}" if row.get("poster_path") else None,
         "release_year": _release_year(row),
         "genre_ids": list(row.get("genre_ids") or []),
+        "trailer_key": row.get("trailer_key") or tmdb_trailer_key(mid),
         "score": round(score, 3) if score is not None else None,
     }
+
 
 
 def _dedupe_rows(rows: list[dict]) -> list[dict]:
@@ -142,24 +148,56 @@ def movies_by_genre(genre_id: int, k: int = 14) -> list[dict]:
     return _movies_from_results(data, k)
 
 
-@lru_cache(maxsize=2)
+FEATURED_GENRES = [
+    {"id": 28, "name": "Action"},
+    {"id": 878, "name": "Sci-Fi"},
+    {"id": 18, "name": "Drama"},
+    {"id": 53, "name": "Thriller"},
+    {"id": 35, "name": "Comedy"},
+    {"id": 16, "name": "Animation"},
+]
+
+
+def _fallback_slice(start: int, count: int) -> list[dict]:
+    from metadata import FALLBACK
+    n = len(FALLBACK)
+    return [
+        _as_movie({
+            "id": m["tmdb_id"],
+            "title": m["title"],
+            "overview": m.get("overview", ""),
+            "poster_path": m.get("poster_path"),
+            "release_date": "2022-01-01",
+        })
+        for m in [FALLBACK[(start + i) % n] for i in range(count)]
+    ]
+
+
+@lru_cache(maxsize=4)
 def browse_catalog(k_per_genre: int = 14) -> dict:
-    genre_rows: list[dict] = []
-    for genre in movie_genres():
-        movies = movies_by_genre(int(genre["id"]), k_per_genre)
-        if movies:
-            genre_rows.append(
-                {
-                    "genre_id": genre["id"],
-                    "name": genre["name"],
-                    "movies": movies,
-                }
-            )
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_genre(g: dict) -> dict:
+        m = movies_by_genre(int(g["id"]), k_per_genre)
+        if not m:
+            m = _fallback_slice(g["id"], k_per_genre)
+        return {"genre_id": g["id"], "name": g["name"], "movies": m}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fut_recent = ex.submit(now_playing, k_per_genre)
+        fut_top = ex.submit(top_rated, k_per_genre)
+        fut_genres = [ex.submit(fetch_genre, g) for g in FEATURED_GENRES]
+
+        recent = fut_recent.result() or _fallback_slice(0, k_per_genre)
+        top = fut_top.result() or _fallback_slice(7, k_per_genre)
+        genre_rows = [f.result() for f in fut_genres]
+
     return {
-        "recent": now_playing(k_per_genre),
-        "top_rated": top_rated(k_per_genre),
-        "genres": genre_rows,
+        "recent": recent,
+        "top_rated": top,
+        "genres": [g for g in genre_rows if g.get("movies")],
     }
+
 
 
 @lru_cache(maxsize=1)
@@ -273,20 +311,34 @@ def recommend_for_watched(
     scores: dict[int, float] = defaultdict(float)
     details: dict[int, dict] = {}
 
+    boosts: dict[int, float] = {}
     for mid in seed_ids:
-        boost = 1.0
+        b = 1.0
         for tid, w in implicit:
             if int(tid) == int(mid):
-                boost = max(boost, w)
-        data = _api(f"/movie/{mid}/recommendations")
+                b = max(b, w)
+        boosts[mid] = b
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_rec(mid: int):
+        return mid, _api(f"/movie/{mid}/recommendations")
+
+    active_seeds = list(seed_ids)[:6]
+    with ThreadPoolExecutor(max_workers=min(6, len(active_seeds) or 1)) as ex:
+        rec_results = list(ex.map(fetch_rec, active_seeds))
+
+    for mid, data in rec_results:
         if not data:
             continue
+        boost = boosts.get(mid, 1.0)
         for rank, row in enumerate(data.get("results", [])[:25]):
             tid = int(row["id"])
             if tid in watched:
                 continue
             scores[tid] += boost * (25 - rank) * float(row.get("vote_average") or 0)
             details.setdefault(tid, row)
+
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     pool: list[dict] = []
